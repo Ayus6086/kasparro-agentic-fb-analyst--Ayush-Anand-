@@ -224,9 +224,3 @@ All evaluation rubric criteria are satisfied:
 - Creative recommendations ✔  
 
 ---
-
-# 📞 Support
-To extend the system, edit the agents located in:
-```
-src/agents/
-```
