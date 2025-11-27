@@ -1,0 +1,5 @@
+seed: 42
+roas_drop_pct: 20
+low_ctr_threshold: 0.5
+lookback_days: 28
+sample_frac: 1.0
