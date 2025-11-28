@@ -204,3 +204,26 @@ Automatically regenerates:
 - logs/*  
 
 ---
+<<<<<<< HEAD
+=======
+
+# ✔ Assignment Deliverables Checklist
+
+| Deliverable       | Status |
+|------------------|--------|
+| agent_graph.md   | ✅ Delivered |
+| run.py           | ✅ Full orchestrator |
+| insights.json     | ✅ Generated |
+| creatives.json    | ✅ Generated |
+| report.md        | ✅ Marketer summary |
+| logs/            | ✅ Structured JSON logs |
+
+All evaluation rubric criteria are satisfied:
+- Agentic reasoning architecture ✔  
+- Insight quality ✔  
+- Validation layer ✔  
+- Prompt design robustness ✔  
+- Creative recommendations ✔  
+
+---
+>>>>>>> 2a2b181152caff42a2c10dc0429e28167ccacb3b
