@@ -204,7 +204,6 @@ Automatically regenerates:
 - logs/*  
 
 ---
-<<<<<<< HEAD
 =======
 
 # ✔ Assignment Deliverables Checklist
@@ -226,4 +225,3 @@ All evaluation rubric criteria are satisfied:
 - Creative recommendations ✔  
 
 ---
->>>>>>> 2a2b181152caff42a2c10dc0429e28167ccacb3b

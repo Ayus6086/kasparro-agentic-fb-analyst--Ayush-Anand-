@@ -1,7 +1,9 @@
 import json
-from pathlib import Path
-import yaml
+import time
 import logging
+from pathlib import Path
+
+import yaml
 
 from src.agents.data_agent import DataAgent
 from src.agents.planner_agent import PlannerAgent
@@ -13,8 +15,20 @@ CONFIG_PATH = Path("config/config.yaml")
 DATA_PATH = Path("data/sample.csv")
 OUT_DIR = Path("reports")
 LOG_DIR = Path("logs")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
+)
 logger = logging.getLogger(__name__)
+
+
+METRICS = {
+    "timings": {},          
+    "retries": {},          
+    "errors": 0,            
+    "campaigns_processed": 0,
+}
+
 
 
 def load_config(path=CONFIG_PATH):
@@ -22,41 +36,12 @@ def load_config(path=CONFIG_PATH):
         return yaml.safe_load(f)
 
 
-def with_retry(name, func, *args, max_retries=3, **kwargs):
-    """
-    Generic retry wrapper.
-    - name: short label for logging ('data_load', 'add_metrics', etc.)
-    - func: function to call
-    - args/kwargs: arguments passed to the function
-    """
-    errors = []
-    for attempt in range(1, max_retries + 1):
-        try:
-            logger.info("Running %s (attempt %d/%d)", name, attempt, max_retries)
-            result = func(*args, **kwargs)
-            if attempt > 1:
-                from pathlib import Path
-            return result
-        except Exception as e:
-            err_str = str(e)
-            errors.append(err_str)
-            logger.error("Error in %s attempt %d: %s", name, attempt, err_str)
-            try:
-                from pathlib import Path
-
-                save_log(f"{name}_error_attempt_{attempt}", {"error": err_str})
-            except Exception:
-                pass
-
-            if attempt == max_retries:
-                save_log(f"{name}_failure", {"errors": errors})
-                raise   
-
 
 def save_log(name, data):
     """
     Saves structured JSON logs to logs/{name}.json
     """
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
     path = LOG_DIR / f"{name}.json"
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
@@ -68,9 +53,8 @@ def pct_change(old, new):
         if old == 0:
             return float("inf") if new > 0 else 0.0
         return (new - old) / abs(old) * 100.0
-    except:
+    except Exception:
         return 0.0
-
 
 
 def extract_roas_drop_stats(all_insights, campaign_name):
@@ -86,6 +70,45 @@ def extract_roas_drop_stats(all_insights, campaign_name):
 
 
 
+def with_retry(name, func, *args, max_retries=3, **kwargs):
+    """
+    Generic retry wrapper with metrics.
+    - name: short label for logging ('data_load', 'add_metrics', etc.)
+    - func: function to call
+    """
+    errors = []
+    retries = 0
+    start_overall = time.perf_counter()
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            logger.info("Running %s (attempt %d/%d)", name, attempt, max_retries)
+            start = time.perf_counter()
+            result = func(*args, **kwargs)
+            duration = time.perf_counter() - start
+
+            METRICS["timings"][name] = METRICS["timings"].get(name, 0.0) + duration
+            METRICS["retries"][name] = retries
+
+            return result
+        except Exception as e:
+            err_str = str(e)
+            errors.append(err_str)
+            retries += 1
+            METRICS["errors"] += 1
+
+            logger.error("Error in %s attempt %d: %s", name, attempt, err_str)
+            save_log(f"{name}_error_attempt_{attempt}", {"error": err_str})
+
+            if attempt == max_retries:
+                save_log(f"{name}_failure", {"errors": errors})
+                raise
+
+    duration_total = time.perf_counter() - start_overall
+    METRICS["timings"][name] = METRICS["timings"].get(name, 0.0) + duration_total
+    METRICS["retries"][name] = retries
+
+
 def main(task_text="Analyze ROAS drop"):
     cfg = load_config()
 
@@ -95,16 +118,23 @@ def main(task_text="Analyze ROAS drop"):
     
     data_agent = DataAgent(sample_frac=cfg.get("sample_frac", 0.2))
 
+    t0 = time.perf_counter()
     df = with_retry("data_load", data_agent.load, DATA_PATH, max_retries=3)
     df = with_retry("add_metrics", data_agent.add_metrics, df, max_retries=2)
+    METRICS["timings"]["data_prep_total"] = time.perf_counter() - t0
 
     summary = data_agent.summarize(df)
     save_log("data_summary", summary)
 
+    drift_info = data_agent.detect_schema_drift(df)
+    save_log("schema_drift", drift_info)
 
     
     planner = PlannerAgent(roas_drop_pct=cfg.get("roas_drop_pct", 20))
+
+    t_plan = time.perf_counter()
     plan = planner.decompose(task_text, summary, df)
+    METRICS["timings"]["planner"] = time.perf_counter() - t_plan
 
     save_log("planner_input", {"task": task_text, "summary": summary})
     save_log("planner_output", plan)
@@ -117,11 +147,20 @@ def main(task_text="Analyze ROAS drop"):
     evaluator = EvaluatorAgent()
     creative_agent = CreativeAgent()
 
-    for camp in plan["target_campaigns"]:
+    campaigns = plan.get("target_campaigns", [])
+    METRICS["campaigns_processed"] = len(campaigns)
 
+    t_insights_total = 0.0
+    t_creatives_total = 0.0
+
+    for camp in campaigns:
+        t_ts = time.perf_counter()
         ts_map = data_agent.aggregate_timeseries(df[df["campaign_name"] == camp])
         timeseries = ts_map.get(camp, [])
+        t_ts_dur = time.perf_counter() - t_ts
+        METRICS["timings"]["timeseries"] = METRICS["timings"].get("timeseries", 0.0) + t_ts_dur
 
+        t_ins = time.perf_counter()
         hypos = insight_agent.generate_hypotheses(camp, timeseries)
 
         for h in hypos:
@@ -131,14 +170,21 @@ def main(task_text="Analyze ROAS drop"):
                 post = [d["ctr"] for d in timeseries[half:]]
                 h["evidence"] = evaluator.validate_ctr_change(pre, post)
 
+        t_insights_total += time.perf_counter() - t_ins
         all_insights[camp] = hypos
         save_log(f"insights_{camp}", hypos)
 
+        t_cre = time.perf_counter()
         df_camp = df[df["campaign_name"] == camp]
         top_examples = df_camp["creative_message"].fillna("Our product").tolist()[:5]
         creatives = creative_agent.suggest(camp, top_examples)
+        t_creatives_total += time.perf_counter() - t_cre
+
         all_creatives[camp] = creatives
         save_log(f"creatives_{camp}", creatives)
+
+    METRICS["timings"]["insight_agents_total"] = t_insights_total
+    METRICS["timings"]["creative_agents_total"] = t_creatives_total
 
     with open(OUT_DIR / "insights.json", "w") as f:
         json.dump(all_insights, f, indent=2)
@@ -147,7 +193,6 @@ def main(task_text="Analyze ROAS drop"):
         json.dump(all_creatives, f, indent=2)
 
     
-
     camp1 = "Men Premium Modal"
     camp2 = "Men Bold Colors Drop"
     camp3 = "WOMEN Seamless Everyday"
@@ -228,11 +273,12 @@ Still strong but room for optimization.
 - `creatives.json`
 - `report.md`
 - `logs/` (structured JSON logs for debugging)
-
 """
 
     with open(OUT_DIR / "report.md", "w", encoding="utf-8") as f:
         f.write(report)
+
+    save_log("metrics", METRICS)
 
     print("Done. Reports written to 'reports/'")
 
