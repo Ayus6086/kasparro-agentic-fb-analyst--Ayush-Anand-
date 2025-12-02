@@ -156,15 +156,10 @@ def main(task_text="Analyze ROAS drop"):
         t_ins = time.perf_counter()
         hypos = insight_agent.generate_hypotheses(camp, timeseries)
 
-        for h in hypos:
-            if h.get("id") == "h_ctr_drop":
-                half = len(timeseries) // 2
-                pre = [d["ctr"] for d in timeseries[:half]]
-                post = [d["ctr"] for d in timeseries[half:]]
-                h["evidence"] = evaluator.validate_ctr_change(pre, post)
+        hypos_enriched = evaluator.enrich_hypotheses(camp, timeseries, hypos)
 
-        t_insights_total += time.perf_counter() - t_ins
-        all_insights[camp] = hypos
+        all_insights[camp] = hypos_enriched
+        save_log(f"insights_{camp}", hypos_enriched)
         save_log(f"insights_{camp}", hypos)
 
         t_cre = time.perf_counter()
