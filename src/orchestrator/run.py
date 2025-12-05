@@ -22,25 +22,26 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 METRICS = {
-    "timings": {},          
-    "retries": {},          
+    "timings": {},           
+    "retries": {},           
     "errors": 0,            
     "campaigns_processed": 0,
 }
 
-def load_config(path=CONFIG_PATH):
-    with open(path, "r") as f:
-        return yaml.safe_load(f)
 
-
-def save_log(name, data):
+def save_log(name: str, payload):
     """
     Saves structured JSON logs to logs/{name}.json
     """
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     path = LOG_DIR / f"{name}.json"
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+        json.dump(payload, f, indent=2, default=str)
+
+
+def load_config(path=CONFIG_PATH):
+    with open(path, "r") as f:
+        return yaml.safe_load(f)
 
 
 def pct_change(old, new):
@@ -53,15 +54,30 @@ def pct_change(old, new):
 
 
 def extract_roas_drop_stats(all_insights, campaign_name):
+    """
+    Extract pre/post ROAS and % change for a given campaign from enriched insights.
+
+    Supports both:
+    - old shape: h["pre_roas"], h["post_roas"]
+    - new shape: h["evidence"]["pre"], h["evidence"]["post"]
+    """
     pre = post = pct = None
     for h in all_insights.get(campaign_name, []):
         if h.get("id") == "h_roas_drop":
             pre = h.get("pre_roas")
             post = h.get("post_roas")
+
+            ev = h.get("evidence") or {}
+            if pre is None and isinstance(ev, dict):
+                pre = ev.get("pre")
+            if post is None and isinstance(ev, dict):
+                post = ev.get("post")
+
             if pre is not None and post is not None:
                 pct = pct_change(pre, post)
             break
     return pre, post, pct
+
 
 def with_retry(name, func, *args, max_retries=3, **kwargs):
     """
@@ -108,91 +124,100 @@ def main(task_text="Analyze ROAS drop"):
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-    
-    data_agent = DataAgent(sample_frac=cfg.get("sample_frac", 0.2))
+    try:
+        data_agent = DataAgent(sample_frac=cfg.get("sample_frac", 0.2))
 
-    t0 = time.perf_counter()
-    df = with_retry("data_load", data_agent.load, DATA_PATH, max_retries=3)
-    df = with_retry("add_metrics", data_agent.add_metrics, df, max_retries=2)
-    METRICS["timings"]["data_prep_total"] = time.perf_counter() - t0
+        t0 = time.perf_counter()
+        df = with_retry("data_load", data_agent.load, DATA_PATH, max_retries=3)
+        df = with_retry("add_metrics", data_agent.add_metrics, df, max_retries=2)
+        METRICS["timings"]["data_prep_total"] = time.perf_counter() - t0
 
-    summary = data_agent.summarize(df)
-    save_log("data_summary", summary)
+        summary = data_agent.summarize(df)
+        save_log("data_summary", summary)
 
-    drift_info = data_agent.detect_schema_drift(df)
-    save_log("schema_drift", drift_info)
+        try:
+            drift_info = data_agent.detect_schema_drift(df)
+            save_log("schema_drift", drift_info)
+        except AttributeError:
+            logger.warning("DataAgent has no detect_schema_drift method; skipping drift log.")
+        except Exception as e:
+            logger.error("Schema drift detection failed: %s", e)
+            save_log("schema_drift_error", {"error": str(e)})
 
-    
-    planner = PlannerAgent(roas_drop_pct=cfg.get("roas_drop_pct", 20))
+        planner = PlannerAgent(roas_drop_pct=cfg.get("roas_drop_pct", 20))
 
-    t_plan = time.perf_counter()
-    plan = planner.decompose(task_text, summary, df)
-    METRICS["timings"]["planner"] = time.perf_counter() - t_plan
+        t_plan = time.perf_counter()
+        plan = planner.decompose(task_text, summary, df)
+        METRICS["timings"]["planner"] = time.perf_counter() - t_plan
 
-    save_log("planner_input", {"task": task_text, "summary": summary})
-    save_log("planner_output", plan)
+        save_log("planner_input", {"task": task_text, "summary": summary})
+        save_log("planner_output", plan)
 
-    
-    all_insights = {}
-    all_creatives = {}
+        all_insights = {}
+        all_creatives = {}
 
-    insight_agent = InsightAgent()
-    evaluator = EvaluatorAgent()
-    creative_agent = CreativeAgent()
+        insight_agent = InsightAgent(
+            roas_drop_pct=cfg.get("roas_drop_pct", 20),
+            ctr_drop_pct=cfg.get("ctr_drop_pct", 15),
+        )
+        evaluator = EvaluatorAgent(
+            roas_drop_pct=cfg.get("roas_drop_pct", 20),
+            ctr_drop_pct=cfg.get("ctr_drop_pct", 15),
+        )
+        creative_agent = CreativeAgent()
 
-    campaigns = plan.get("target_campaigns", [])
-    METRICS["campaigns_processed"] = len(campaigns)
+        campaigns = plan.get("target_campaigns", [])
+        METRICS["campaigns_processed"] = len(campaigns)
 
-    t_insights_total = 0.0
-    t_creatives_total = 0.0
+        t_insights_total = 0.0
+        t_creatives_total = 0.0
 
-    for camp in campaigns:
-        t_ts = time.perf_counter()
-        ts_map = data_agent.aggregate_timeseries(df[df["campaign_name"] == camp])
-        timeseries = ts_map.get(camp, [])
-        t_ts_dur = time.perf_counter() - t_ts
-        METRICS["timings"]["timeseries"] = METRICS["timings"].get("timeseries", 0.0) + t_ts_dur
+        for camp in campaigns:
+            t_ts = time.perf_counter()
+            ts_map = data_agent.aggregate_timeseries(df[df["campaign_name"] == camp])
+            timeseries = ts_map.get(camp, [])
+            t_ts_dur = time.perf_counter() - t_ts
+            METRICS["timings"]["timeseries"] = METRICS["timings"].get("timeseries", 0.0) + t_ts_dur
 
-        t_ins = time.perf_counter()
-        hypos = insight_agent.generate_hypotheses(camp, timeseries)
+            t_ins = time.perf_counter()
+            hypos = insight_agent.generate_hypotheses(camp, timeseries)
+            hypos_enriched = evaluator.enrich_hypotheses(camp, timeseries, hypos)
+            t_insights_total += time.perf_counter() - t_ins
 
-        hypos_enriched = evaluator.enrich_hypotheses(camp, timeseries, hypos)
+            all_insights[camp] = hypos_enriched
+            save_log(f"insights_{camp}", hypos_enriched)
+            save_log(f"insights_raw_{camp}", hypos)
 
-        all_insights[camp] = hypos_enriched
-        save_log(f"insights_{camp}", hypos_enriched)
-        save_log(f"insights_{camp}", hypos)
+            t_cre = time.perf_counter()
+            df_camp = df[df["campaign_name"] == camp]
+            top_examples = df_camp["creative_message"].fillna("Our product").tolist()[:5]
+            creatives = creative_agent.suggest(camp, top_examples, insights=hypos_enriched)
+            t_creatives_total += time.perf_counter() - t_cre
 
-        t_cre = time.perf_counter()
-        df_camp = df[df["campaign_name"] == camp]
-        top_examples = df_camp["creative_message"].fillna("Our product").tolist()[:5]
-        creatives = creative_agent.suggest(camp, top_examples)
-        t_creatives_total += time.perf_counter() - t_cre
+            all_creatives[camp] = creatives
+            save_log(f"creatives_{camp}", creatives)
 
-        all_creatives[camp] = creatives
-        save_log(f"creatives_{camp}", creatives)
+        METRICS["timings"]["insight_agents_total"] = t_insights_total
+        METRICS["timings"]["creative_agents_total"] = t_creatives_total
 
-    METRICS["timings"]["insight_agents_total"] = t_insights_total
-    METRICS["timings"]["creative_agents_total"] = t_creatives_total
+        with open(OUT_DIR / "insights.json", "w", encoding="utf-8") as f:
+            json.dump(all_insights, f, indent=2, default=str)
 
-    with open(OUT_DIR / "insights.json", "w") as f:
-        json.dump(all_insights, f, indent=2)
+        with open(OUT_DIR / "creatives.json", "w", encoding="utf-8") as f:
+            json.dump(all_creatives, f, indent=2, default=str)
 
-    with open(OUT_DIR / "creatives.json", "w") as f:
-        json.dump(all_creatives, f, indent=2)
+        camp1 = "Men Premium Modal"
+        camp2 = "Men Bold Colors Drop"
+        camp3 = "WOMEN Seamless Everyday"
 
-    
-    camp1 = "Men Premium Modal"
-    camp2 = "Men Bold Colors Drop"
-    camp3 = "WOMEN Seamless Everyday"
+        c1_pre, c1_post, c1_pct = extract_roas_drop_stats(all_insights, camp1)
+        c2_pre, c2_post, c2_pct = extract_roas_drop_stats(all_insights, camp2)
+        c3_pre, c3_post, c3_pct = extract_roas_drop_stats(all_insights, camp3)
 
-    c1_pre, c1_post, c1_pct = extract_roas_drop_stats(all_insights, camp1)
-    c2_pre, c2_post, c2_pct = extract_roas_drop_stats(all_insights, camp2)
-    c3_pre, c3_post, c3_pct = extract_roas_drop_stats(all_insights, camp3)
+        def fmt(x, d=2):
+            return "N/A" if x is None else f"{x:.{d}f}"
 
-    def fmt(x, d=2):
-        return "N/A" if x is None else f"{x:.{d}f}"
-
-    report = f"""
+        report = f"""
 # Performance Analysis Report – Synthetic Facebook Ads (Undergarments)
 
 **Task:** {task_text}  
@@ -263,12 +288,21 @@ Still strong but room for optimization.
 - `logs/` (structured JSON logs for debugging)
 """
 
-    with open(OUT_DIR / "report.md", "w", encoding="utf-8") as f:
-        f.write(report)
+        with open(OUT_DIR / "report.md", "w", encoding="utf-8") as f:
+            f.write(report)
 
-    save_log("metrics", METRICS)
+        save_log("metrics", METRICS)
 
-    print("Done. Reports written to 'reports/'")
+        print("Done. Reports written to 'reports/'")
+
+    except Exception as e:
+        error_payload = {
+            "error": str(e),
+            "type": e.__class__.__name__,
+        }
+        save_log("run_error", error_payload)
+        logger.exception("Pipeline failed. See logs/run_error.json for details.")
+        print("Pipeline failed. Please check logs/run_error.json for details.")
 
 
 if __name__ == "__main__":
